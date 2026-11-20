@@ -1,0 +1,50 @@
+name: build-h7000
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build-h7000:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential uuid-dev iasl nasm python3 python-is-python3 \
+            git gcc-aarch64-linux-gnu acpica-tools mtools dosfstools \
+            device-tree-compiler
+
+      - name: Check submodules populated
+        run: |
+          ls -la
+          ls -la Common/edk2 2>/dev/null | head -20 || true
+
+      - name: Show h7000 platform files
+        run: |
+          find . -iname "*h7000*" -maxdepth 6 | head -40 || true
+
+      - name: Build boot-h7000.img
+        run: |
+          chmod +x build.sh || true
+          ./build.sh --device h7000 2>&1 | tee build.log
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-h7000
+          path: |
+            boot-*.img
+            build.log
+          if-no-files-found: warn
+          retention-days: 7
