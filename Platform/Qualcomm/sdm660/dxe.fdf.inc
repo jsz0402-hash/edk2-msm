@@ -76,14 +76,19 @@
     SECTION UI = "SPMI"
   }
 
-  FILE DRIVER = 5776232e-082d-4b75-9a0e-fe1d13f7a5d9 {   SECTION DXE_DEPEX = Platform/EFI_Binaries/Drivers/sdm660/PmicDxe/PmicDxe.depex   SECTION PE32 = Platform/EFI_Binaries/Drivers/sdm660/PmicDxe/PmicDxe.efi   SECTION UI = "PmicDxe"  }
+  FILE DRIVER = 5776232e-082d-4b75-9a0e-fe1d13f7a5d9 {
+    SECTION DXE_DEPEX = Platform/EFI_Binaries/Drivers/sdm660/PmicDxe/PmicDxe.depex
+    SECTION PE32 = Platform/EFI_Binaries/Drivers/sdm660/PmicDxe/PmicDxe.efi
+    SECTION UI = "PmicDxe"
+  }
+
   FILE DRIVER = 94f8a6a7-dc34-4101-88c1-99179cceae83 {
     SECTION DXE_DEPEX = Platform/EFI_Binaries/Drivers/sdm660/UsbfnDwc3Dxe/UsbfnDwc3Dxe.depex
     SECTION PE32 = Platform/EFI_Binaries/Drivers/sdm660/UsbfnDwc3Dxe/UsbfnDwc3Dxe.efi
     SECTION UI = "UsbfnDwc3Dxe"
   }
 
-  #FILE DRIVER = cd823a4d-7dec-4531-ae5d-4134fa4127b8 {    #SECTION DXE_DEPEX = Platform/EFI_Binaries/Drivers/sdm660/UsbConfigDxe/UsbConfigDxe.depex    #SECTION PE32 = Platform/EFI_Binaries/Drivers/sdm660/UsbConfigDxe/UsbConfigDxe.efi    #SECTION UI = "UsbConfigDxe"  #}
+
   FILE DRIVER = 0A134F0E-075E-40B3-9C63-3B3906804663 {
     SECTION DXE_DEPEX = Platform/EFI_Binaries/Drivers/sdm660/UsbInitDxe/UsbInitDxe.depex
     SECTION PE32 = Platform/EFI_Binaries/Drivers/sdm660/UsbInitDxe/UsbInitDxe.efi
@@ -94,6 +99,11 @@
     SECTION DXE_DEPEX = Platform/EFI_Binaries/Drivers/sdm660/UsbDeviceDxe/UsbDeviceDxe.depex
     SECTION PE32 = Platform/EFI_Binaries/Drivers/sdm660/UsbDeviceDxe/UsbDeviceDxe.efi
     SECTION UI = "UsbDeviceDxe"
+  }
+  FILE DRIVER = cd823a4d-7dec-4531-ae5d-4134fa4127b8 {
+    SECTION DXE_DEPEX = Platform/EFI_Binaries/Drivers/sdm660/UsbConfigDxe/UsbConfigDxe.depex
+    SECTION PE32 = Platform/EFI_Binaries/Drivers/sdm660/UsbConfigDxe/UsbConfigDxe.efi
+    SECTION UI = "UsbConfigDxe"
   }
 
   FILE DRIVER = 0d35cd8e-97ea-4f9a-96af-0f0d89f76567 {

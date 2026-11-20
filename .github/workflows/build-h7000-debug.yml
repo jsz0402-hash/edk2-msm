@@ -1,0 +1,46 @@
+name: build-h7000-debug
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-h7000-debug:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential uuid-dev iasl nasm python3 python-is-python3 \
+            git gcc-aarch64-linux-gnu acpica-tools mtools dosfstools \
+            device-tree-compiler gettext bc bison flex libssl-dev \
+            libelf-dev zip clang llvm lld abootimg
+
+      - name: Show git state
+        run: |
+          git log --oneline -5
+          grep -n "PmicDxe\|UsbConfigDxe" Platform/Qualcomm/sdm660/dxe.fdf.inc | head -20 || true
+
+      - name: Build DEBUG boot-h7000.img (exception display ON)
+        run: |
+          set -o pipefail
+          chmod +x build.sh || true
+          ./build.sh --device h7000 -r DEBUG 2>&1 | tee build.log
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-h7000-debug
+          path: |
+            boot-*.img
+            build.log
+          if-no-files-found: warn
+          retention-days: 7
