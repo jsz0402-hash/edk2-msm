@@ -23,7 +23,7 @@ jobs:
             build-essential uuid-dev iasl nasm python3 python-is-python3 \
             git gcc-aarch64-linux-gnu acpica-tools mtools dosfstools \
             device-tree-compiler gettext bc bison flex libssl-dev \
-            libelf-dev zip clang llvm lld
+            libelf-dev zip clang llvm lld abootimg
 
       - name: Check submodules populated
         run: |
