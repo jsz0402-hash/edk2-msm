@@ -168,5 +168,4 @@ APRIORI DXE {
   #
   # UsbProbeDxe: dispatched first-ish so it can install PMIC USB stub before UsbConfigDxe
   #
-  INF Platform/Bbkedu/sdm660/UsbProbeDxe/UsbProbeDxe.inf
 }

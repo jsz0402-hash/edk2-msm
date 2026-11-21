@@ -126,17 +126,21 @@ READ_LOCK_STATUS   = TRUE
 
   INF MdeModulePkg/Universal/WatchdogTimerDxe/WatchdogTimer.inf
 
+
   #
-  # UsbProbeDxe: PMIC USB protocol diagnostics / stub (h7000)
+  # UsbProbeDxe: prebuilt PE32 (v8) + explicit depex TRUE
+  # (bypass AutoGen-added gEfiPcdProtocolGuid dependency)
   #
-  INF Platform/Bbkedu/sdm660/UsbProbeDxe/UsbProbeDxe.inf
+  FILE DRIVER = 7d1f2c3a-9b64-4e21-8c5f-0a1b2c3d4e5f {
+    SECTION PE32 = Platform/Bbkedu/sdm660/PatchedBinaries/UsbProbeDxe.efi
+    SECTION UI = "UsbProbeDxe"
+  }
 
 # BSP drivers
 !include Platform/Qualcomm/sdm660/dxe.fdf.inc
   #
   # Stage2Dxe: stage probe (after dxe.fdf.inc include)
   #
-  INF Platform/Bbkedu/sdm660/Stage2Dxe/Stage2Dxe.inf
 
 
   # INF Silicon/Qualcomm/sdm660/Drivers/sdm660Dxe/sdm660Dxe.inf
@@ -151,7 +155,6 @@ READ_LOCK_STATUS   = TRUE
   #
   # Stage3Dxe: stage probe (after USB host drivers)
   #
-  INF Platform/Bbkedu/sdm660/Stage3Dxe/Stage3Dxe.inf
 
 
   #
