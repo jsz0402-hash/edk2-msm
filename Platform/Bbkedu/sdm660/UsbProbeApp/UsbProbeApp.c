@@ -1,17 +1,14 @@
 /** @file
-  UsbProbeApp (v1) - UEFI Shell application version of the h7000 USB probe.
+  UsbProbeApp v2 - Shell app probe for h7000 USB device mode.
 
-  Run from startup.nsh inside the UEFI Shell: console is guaranteed ready and
-  every line is also appended to \probe_log.txt on the first writable FAT volume
-  (so the log can be pulled via adb/TWRP without scrolling the screen).
+  v2 additions on top of v1:
+   * DUMP section (loaded at heartbeat 10/15):
+       - USB_CONFIG protocol interface pointer, driver private struct base (iface-0xE8)
+         and a hex dump of it (fields like core base 0xA800000 / PHY enable value);
+       - DWC3 / QUSB2PHY / QMP register reads at known Qualcomm physical addresses;
+   * everything (incl. dumps) is also appended to \probe_log.txt on a FAT volume.
 
-  What it does:
-   1. GOP status bars at top-left: RED=app alive, GREEN=TypeC present/stub,
-      BLUE=StartController succeeded, WHITE cells=heartbeat count;
-   2. enumerate SimpleFileSystem volumes and try \EFI\hakios\payload.bin;
-   3. call USB_CONFIG->StartController(core=0, connType=8/1) to force device mode;
-   4. re-check USBFN_IO a few seconds later;
-   5. exit after ~10 seconds (does not block the Shell).
+  Run from startup.nsh inside UEFI Shell. Exits after ~10-12 s, does not block Shell.
 **/
 #include <Uefi.h>
 #include <Library/UefiApplicationEntryPoint.h>
@@ -38,6 +35,11 @@ STATIC EFI_GUID mUsbfnIoGuid = { 0x32d2963a, 0xfe5d, 0x4f30,
 STATIC EFI_GUID mSfsGuid = { 0x964e5b22, 0x6459, 0x11d2,
                              { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } };
 
+/* Qualcomm sdm660 (h7000) physical addresses from DT */
+#define SSUSB_BASE      0x0A800000ULL   /* ssusb@a800000 (DWC3 wrapper) */
+#define QUSB2PHY_BASE   0x0C012000ULL   /* qusb@c012000 (HS PHY) */
+#define QMP_BASE        0x0C010000ULL   /* ssphy@c010000 (SS QMP PHY) */
+
 STATIC
 EFI_STATUS
 EFIAPI
@@ -48,7 +50,6 @@ ProbeStubOk (
   return EFI_SUCCESS;
 }
 
-/* ---------------- output: console + log file ---------------- */
 STATIC
 VOID
 Log (
@@ -101,13 +102,8 @@ OpenLogFile (
     if (EFI_ERROR (Status) || (Root == NULL)) {
       continue;
     }
-    Status = Root->Open (
-                     Root,
-                     &File,
-                     L"\\probe_log.txt",
-                     EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
-                     0
-                     );
+    Status = Root->Open (Root, &File, L"\\probe_log.txt",
+                         EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
     if (!EFI_ERROR (Status) && (File != NULL)) {
       File->SetPosition (File, 0xFFFFFFFFFFFFFFFFULL);
       mLogFile = File;
@@ -124,7 +120,6 @@ OpenLogFile (
   }
 }
 
-/* ---------------- GOP bars ---------------- */
 STATIC
 VOID
 DrawBar (
@@ -175,19 +170,113 @@ DrawStatus (
   if (mGop == NULL) {
     return;
   }
-  DrawBar (8, 8, 120, 10, 0xFF, 0x00, 0x00);              /* RED: app alive */
+  DrawBar (8, 8, 120, 10, 0xFF, 0x00, 0x00);
   if (TypeCPresent) {
-    DrawBar (142, 8, 120, 10, 0x00, 0xFF, 0x00);          /* GREEN: TypeC */
+    DrawBar (142, 8, 120, 10, 0x00, 0xFF, 0x00);
   }
   if (!EFI_ERROR (mStartStatus)) {
-    DrawBar (276, 8, 120, 10, 0x00, 0x00, 0xFF);          /* BLUE: StartController ok */
+    DrawBar (276, 8, 120, 10, 0x00, 0x00, 0xFF);
   }
   for (i = 0; (i < Beat) && (i < 10); i++) {
-    DrawBar (410 + i * 12, 8, 8, 10, 0xFF, 0xFF, 0xFF);   /* WHITE cells: heartbeat */
+    DrawBar (410 + i * 12, 8, 8, 10, 0xFF, 0xFF, 0xFF);
   }
 }
 
-/* ---------------- payload.bin check ---------------- */
+/* ---------------- dump helpers ---------------- */
+STATIC
+VOID
+DumpBytes (
+  IN CONST CHAR16  *Tag,
+  IN CONST UINT8   *Ptr,
+  IN UINTN          Len
+  )
+{
+  CHAR16  Line[160];
+  UINTN   i;
+  UINTN   pos;
+
+  Log (L">>> DUMP %s @0x%lx len=%u\r\n", Tag, (UINT64)(UINTN)Ptr, (UINT32)Len);
+  for (i = 0; i < Len; i += 16) {
+    pos = 0;
+    pos += UnicodeSPrint (Line + pos, sizeof (Line) - pos * sizeof (CHAR16), L"  %04x:", (UINT32)i);
+    {
+      UINTN j;
+      for (j = 0; (j < 16) && (i + j < Len); j++) {
+        pos += UnicodeSPrint (Line + pos, sizeof (Line) - pos * sizeof (CHAR16), L" %02x", Ptr[i + j]);
+      }
+    }
+    UnicodeSPrint (Line + pos, sizeof (Line) - pos * sizeof (CHAR16), L"\r\n");
+    Log (L"%s", Line);
+  }
+}
+
+STATIC
+UINT32
+Rd32 (
+  IN UINT64  Addr
+  )
+{
+  return *(volatile UINT32 *)(UINTN)Addr;
+}
+
+STATIC
+VOID
+DumpRegs (
+  VOID
+  )
+{
+  VOID    *Ifc = NULL;
+  UINT8   *Base;
+  EFI_STATUS  Status;
+
+  Log (L">>> ============ DUMP (v2) ============\r\n");
+
+  Status = gBS->LocateProtocol (&mUsbConfigGuid, NULL, &Ifc);
+  Log (L">>> USB_CONFIG iface=0x%lx (%r)\r\n", (UINT64)(UINTN)Ifc, Status);
+  if (!EFI_ERROR (Status) && (Ifc != NULL)) {
+    DumpBytes (L"usbcfg-vtable", (CONST UINT8 *)Ifc, 0x40);
+    Base = (UINT8 *)Ifc - 0xE8;
+    if ((UINTN)Base > 0x1000) {
+      UINT64 CoreBase = *(volatile UINT64 *)(UINTN)(Base + 0x68);
+      Log (L">>> drvpriv base=0x%lx  [base+0x68](core base?)=0x%lx\r\n",
+           (UINT64)(UINTN)Base, CoreBase);
+      DumpBytes (L"drvpriv-0x100", (CONST UINT8 *)Base, 0x100);
+    }
+  }
+
+  Log (L">>> DWC3 regs @0x%lx:\r\n", (UINT64)SSUSB_BASE);
+  Log (L">>>   +0x000=0x%08x +0x004=0x%08x +0x008=0x%08x +0x00c=0x%08x\r\n",
+       Rd32 (SSUSB_BASE + 0x000), Rd32 (SSUSB_BASE + 0x004),
+       Rd32 (SSUSB_BASE + 0x008), Rd32 (SSUSB_BASE + 0x00c));
+  Log (L">>>   +0x4c8=0x%08x +0x4cc=0x%08x +0x504=0x%08x +0x50c=0x%08x\r\n",
+       Rd32 (SSUSB_BASE + 0x4C8), Rd32 (SSUSB_BASE + 0x4CC),
+       Rd32 (SSUSB_BASE + 0x504), Rd32 (SSUSB_BASE + 0x50C));
+  Log (L">>>   +0x40c=0x%08x +0xc100=0x%08x +0xc104=0x%08x +0xc110=0x%08x\r\n",
+       Rd32 (SSUSB_BASE + 0x40C), Rd32 (SSUSB_BASE + 0xC100),
+       Rd32 (SSUSB_BASE + 0xC104), Rd32 (SSUSB_BASE + 0xC110));
+  Log (L">>>   +0xc120=0x%08x +0xc124=0x%08x +0xc140=0x%08x +0xc144=0x%08x\r\n",
+       Rd32 (SSUSB_BASE + 0xC120), Rd32 (SSUSB_BASE + 0xC124),
+       Rd32 (SSUSB_BASE + 0xC140), Rd32 (SSUSB_BASE + 0xC144));
+
+  Log (L">>> QUSB2PHY regs @0x%lx:\r\n", (UINT64)QUSB2PHY_BASE);
+  Log (L">>>   +0x00=0x%08x +0x04=0x%08x +0x08=0x%08x +0x0c=0x%08x\r\n",
+       Rd32 (QUSB2PHY_BASE + 0x00), Rd32 (QUSB2PHY_BASE + 0x04),
+       Rd32 (QUSB2PHY_BASE + 0x08), Rd32 (QUSB2PHY_BASE + 0x0C));
+  Log (L">>>   +0x30=0x%08x +0x34=0x%08x +0x40=0x%08x +0x44=0x%08x\r\n",
+       Rd32 (QUSB2PHY_BASE + 0x30), Rd32 (QUSB2PHY_BASE + 0x34),
+       Rd32 (QUSB2PHY_BASE + 0x40), Rd32 (QUSB2PHY_BASE + 0x44));
+
+  Log (L">>> QMP regs @0x%lx:\r\n", (UINT64)QMP_BASE);
+  Log (L">>>   +0x00=0x%08x +0x04=0x%08x +0x08=0x%08x +0x20=0x%08x\r\n",
+       Rd32 (QMP_BASE + 0x00), Rd32 (QMP_BASE + 0x04),
+       Rd32 (QMP_BASE + 0x08), Rd32 (QMP_BASE + 0x20));
+  Log (L">>>   +0x24=0x%08x +0x30=0x%08x +0x34=0x%08x +0x38=0x%08x\r\n",
+       Rd32 (QMP_BASE + 0x24), Rd32 (QMP_BASE + 0x30),
+       Rd32 (QMP_BASE + 0x34), Rd32 (QMP_BASE + 0x38));
+  Log (L">>> =================================\r\n");
+}
+
+/* ---------------- payload check ---------------- */
 STATIC
 VOID
 CheckPayload (
@@ -213,12 +302,10 @@ CheckPayload (
 
     Status = gBS->HandleProtocol (Handles[i], &mSfsGuid, (VOID **)&Sfs);
     if (EFI_ERROR (Status) || (Sfs == NULL)) {
-      Log (L">>> PAYLOAD vol%u: no SFS\r\n", (UINT32)i);
       continue;
     }
     Status = Sfs->OpenVolume (Sfs, &Root);
     if (EFI_ERROR (Status) || (Root == NULL)) {
-      Log (L">>> PAYLOAD vol%u: OpenVolume=%r\r\n", (UINT32)i, Status);
       continue;
     }
     OpenStatus = Root->Open (Root, &File, L"\\EFI\\hakios\\payload.bin", EFI_FILE_MODE_READ, 0);
@@ -259,7 +346,6 @@ CheckPayload (
   FreePool (Handles);
 }
 
-/* ---------------- StartController ---------------- */
 STATIC
 VOID
 TryStartController (
@@ -325,7 +411,7 @@ UsbProbeAppEntry (
   OpenLogFile ();
 
   Log (L"\r\n>>> ================================================\r\n");
-  Log (L">>> PROBE-APP: entry reached (UsbProbeApp v1)\r\n");
+  Log (L">>> PROBE-APP v2: entry reached\r\n");
   Log (L">>> log file: %a:\\probe_log.txt\r\n", mLogVol);
   Log (L">>> ================================================\r\n");
 
@@ -362,11 +448,11 @@ UsbProbeAppEntry (
 
   DrawStatus (0, TypeCPresent);
 
-  for (Beat = 1; Beat <= 20; Beat++) {
+  for (Beat = 1; Beat <= 24; Beat++) {
     DrawStatus (Beat, TypeCPresent);
     Log (L">>> PROBE-APP: HB %u\r\n", (UINT32)Beat);
 
-    if ((Beat == 3) || (Beat == 8) || (Beat == 15)) {
+    if ((Beat == 3) || (Beat == 15)) {
       PrintStat (Beat, TypeCPresent);
     }
     if (Beat == 4) {
@@ -378,17 +464,21 @@ UsbProbeAppEntry (
     if ((Beat == 6) && EFI_ERROR (mStartStatus)) {
       TryStartController (1);
     }
-    if (Beat == 12) {
+    if (Beat == 10) {
+      DumpRegs ();
+    }
+    if (Beat == 14) {
       VOID        *UsbFn = NULL;
       EFI_STATUS   St = gBS->LocateProtocol (&mUsbfnIoGuid, NULL, &UsbFn);
-      Log (L">>> 3s after StartController: USBFN_IO=%a (%r)\r\n",
+      Log (L">>> after StartController: USBFN_IO=%a (%r)\r\n",
            (UsbFn != NULL) ? "OK" : "NO", St);
+      PrintStat (Beat, TypeCPresent);
     }
     gBS->Stall (500000);
   }
 
-  PrintStat (20, TypeCPresent);
-  DrawStatus (20, TypeCPresent);
+  PrintStat (24, TypeCPresent);
+  DrawStatus (24, TypeCPresent);
 
   if ((Stub != NULL) && (StubHandle != NULL)) {
     gBS->UninstallProtocolInterface (StubHandle, &mTypeCGuid, Stub);
@@ -396,7 +486,7 @@ UsbProbeAppEntry (
     Log (L">>> TypeC temp stub uninstalled\r\n");
   }
 
-  Log (L">>> PROBE-APP: done, exiting. log = %a:\\probe_log.txt\r\n", mLogVol);
+  Log (L">>> PROBE-APP v2: done, exiting. log = %a:\\probe_log.txt\r\n", mLogVol);
   if (mLogFile != NULL) {
     mLogFile->Close (mLogFile);
     mLogFile = NULL;
