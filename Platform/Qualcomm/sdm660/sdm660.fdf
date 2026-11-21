@@ -130,6 +130,7 @@ READ_LOCK_STATUS   = TRUE
   # UsbProbeDxe: PMIC USB protocol diagnostics / stub (h7000)
   #
   INF Platform/Bbkedu/sdm660/UsbProbeDxe/UsbProbeDxe.inf
+  INF Platform/Bbkedu/sdm660/UsbProbeApp/UsbProbeApp.inf
 
 # BSP drivers
 !include Platform/Qualcomm/sdm660/dxe.fdf.inc

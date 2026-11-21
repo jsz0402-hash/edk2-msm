@@ -1,0 +1,32 @@
+## @file
+#  UsbProbeApp: UEFI Shell 应用版 h7000 USB 诊断探针
+##
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = UsbProbeApp
+  FILE_GUID                      = 5d2b0a11-7c44-4e8a-9b1f-3a6c8d2e4f01
+  MODULE_TYPE                    = UEFI_APPLICATION
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = UsbProbeAppEntry
+
+[Sources]
+  UsbProbeApp.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  UefiApplicationEntryPoint
+  UefiBootServicesTableLib
+  BaseLib
+  BaseMemoryLib
+  MemoryAllocationLib
+  PrintLib
+
+[Protocols]
+  gEfiGraphicsOutputProtocolGuid
+  gEfiSimpleFileSystemProtocolGuid
+
+[Guids]
+  gEfiFileInfoGuid
