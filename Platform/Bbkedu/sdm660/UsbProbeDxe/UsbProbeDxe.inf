@@ -1,5 +1,5 @@
 ## @file
-#  诊断驱动: 探测 PMIC USB 等 protocol 是否存在, 缺失时装载 stub.
+#  诊断/修复驱动: 探测 PMIC USB 等 protocol 是否存在, 缺失时装载 stub.
 ##
 [Defines]
   INF_VERSION                    = 0x00010005
@@ -23,6 +23,7 @@
   BaseLib
   BaseMemoryLib
   MemoryAllocationLib
+  DebugLib
 
 [Depex]
   TRUE
