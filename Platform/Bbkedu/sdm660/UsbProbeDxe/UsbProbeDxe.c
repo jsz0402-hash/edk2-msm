@@ -1,10 +1,9 @@
 /** @file
-  诊断/修复驱动 (v5):
-  1. 打印关键 protocol 状态 (ConOut + DebugLib 双通道);
-  2. 若 USB Type-C protocol 缺失, 装 stub;
-  3. 周期心跳 (1s): 计数 + USB_CONFIG / USBFN_IO + 卷(SimpleFileSystem)数量.
-     - 心跳持续 => 系统活着(不是 DXE 调度卡死);
-     - 卷数量 => 不用键盘也能确认 Shell 能看到哪些 FS 卷.
+  诊断/修复驱动 (v6):
+  1. 装 USB Type-C protocol 桩 (所有方法返回 EFI_SUCCESS);
+  2. 心跳打印 (>>> 前缀): Type-C / USB_CONFIG / USBFN_IO / FS 卷数量;
+  3. 心跳第 5 拍开始尝试调用 USB_CONFIG->StartController(core=0, connType=8/1)
+     强制启动 device 模式 (mode 1 = device), 打印返回状态.
 **/
 #include <Uefi.h>
 #include <Library/UefiBootServicesTableLib.h>
@@ -14,25 +13,14 @@
 #include <Library/MemoryAllocationLib.h>
 #include <Library/DebugLib.h>
 
-#define HEARTBEAT_MAX 60
+#define HEARTBEAT_MAX 90
 
 STATIC EFI_EVENT mHeartbeatEvent;
 STATIC UINTN     mBeatCount;
+STATIC BOOLEAN   mStartTried;
 
 STATIC EFI_GUID mTypeCGuid = { 0x6adb9972, 0x083d, 0x4be4,
                                { 0xbb, 0x74, 0xc7, 0x25, 0xa7, 0x30, 0x61, 0x56 } };
-STATIC EFI_GUID mChipInfoGuid = { 0xb0760469, 0x970c, 0x487a,
-                                  { 0xa4, 0xb5, 0x28, 0xdb, 0x7b, 0x45, 0xce, 0xf1 } };
-STATIC EFI_GUID mClockGuid = { 0x241afae6, 0x885f, 0x4f6c,
-                               { 0xa7, 0xea, 0xc2, 0x8e, 0xab, 0x79, 0xc3, 0xe5 } };
-STATIC EFI_GUID mPmicVregGuid = { 0x22d38d3d, 0xe8b6, 0x4f8f,
-                                  { 0x9c, 0x26, 0xbc, 0xeb, 0x07, 0xd6, 0xcb, 0x68 } };
-STATIC EFI_GUID mSmemGuid = { 0xf4e5c7d0, 0xd239, 0x47cb,
-                              { 0xaa, 0xcd, 0x7f, 0x66, 0xef, 0x76, 0x32, 0x38 } };
-STATIC EFI_GUID mPlatformInfoGuid = { 0x157a5c45, 0x21b2, 0x43c5,
-                                      { 0xba, 0x7c, 0x82, 0x2f, 0xee, 0x5f, 0xe5, 0x99 } };
-STATIC EFI_GUID mAcpiSdtGuid = { 0xeb97088e, 0xcfdf, 0x49c6,
-                                 { 0xbe, 0x4b, 0xd9, 0x06, 0xa5, 0xb2, 0x0e, 0x86 } };
 STATIC EFI_GUID mUsbConfigGuid = { 0xe722b03f, 0xb250, 0x42ce,
                                    { 0x8e, 0xbd, 0x5b, 0xd5, 0x18, 0x12, 0xd0, 0x37 } };
 STATIC EFI_GUID mUsbfnIoGuid = { 0x32d2963a, 0xfe5d, 0x4f30,
@@ -45,11 +33,11 @@ STATIC VOID *mStubProtocol = NULL;
 STATIC
 EFI_STATUS
 EFIAPI
-StubFunction (
+StubOk (
   VOID
   )
 {
-  return EFI_UNSUPPORTED;
+  return EFI_SUCCESS;
 }
 
 STATIC
@@ -60,8 +48,8 @@ Say (
   IN UINT64       Value
   )
 {
-  AsciiPrint ("UsbProbe: %a status=%r val=0x%lx\n", Text, Status, Value);
-  DEBUG ((DEBUG_ERROR, "UsbProbe: %a status=%r val=0x%lx\n", Text, Status, Value));
+  AsciiPrint (">>> UsbProbe: %a status=%r val=0x%lx\n", Text, Status, Value);
+  DEBUG ((DEBUG_ERROR, ">>> UsbProbe: %a status=%r val=0x%lx\n", Text, Status, Value));
 }
 
 STATIC
@@ -76,6 +64,7 @@ PrintOne (
 
   Status = gBS->LocateProtocol (Guid, NULL, &Ifc);
   Say (Name, Status, (UINT64)(UINTN)Ifc);
+  return;
 }
 
 STATIC
@@ -87,7 +76,6 @@ PrintVolumes (
   EFI_STATUS  Status;
   EFI_HANDLE  *Handles = NULL;
   UINTN       Count = 0;
-  UINTN       i;
 
   Status = gBS->LocateHandleBuffer (ByProtocol, &mSfsGuid, NULL, &Count, &Handles);
   if (EFI_ERROR (Status)) {
@@ -95,10 +83,65 @@ PrintVolumes (
     return;
   }
   Say ("volumes(fs)", EFI_SUCCESS, Count);
-  for (i = 0; i < Count && i < 8; i++) {
-    AsciiPrint ("UsbProbe:   fs handle[%u]=0x%lx\n", i, (UINT64)(UINTN)Handles[i]);
+  if (Handles != NULL) {
+    FreePool (Handles);
   }
-  FreePool (Handles);
+}
+
+/* 尝试用 USB_CONFIG 协议的 StartController 强制启动 device 模式 */
+STATIC
+VOID
+TryStartController (
+  IN UINT32 ConnType
+  )
+{
+  EFI_STATUS  Status;
+  VOID        *Ifc = NULL;
+  UINTN       Func;
+
+  Status = gBS->LocateProtocol (&mUsbConfigGuid, NULL, &Ifc);
+  if (EFI_ERROR (Status) || Ifc == NULL) {
+    Say ("StartController: no USB_CONFIG", Status, 0);
+    return;
+  }
+  Func = ((UINTN *)Ifc)[10]; /* vtable offset 0x50 = StartController */
+  Say ("StartController->vtable[10]", EFI_SUCCESS, (UINT64)Func);
+  if (Func == 0) {
+    return;
+  }
+  Status = ((EFI_STATUS (EFIAPI *)(VOID *, UINT32, UINT32))Func)(Ifc, 0, ConnType);
+  Say ("StartController(0,connType)", Status, ConnType);
+}
+
+STATIC
+VOID
+InstallStub (
+  VOID
+  )
+{
+  EFI_STATUS  Status;
+  EFI_HANDLE  Handle = NULL;
+  UINT8       *Buf;
+  UINTN       i;
+
+  if (mStubProtocol != NULL) {
+    return;
+  }
+  Buf = AllocateZeroPool (0x100);
+  if (Buf == NULL) {
+    return;
+  }
+  for (i = 0; i < 0x100 / sizeof (UINTN); i++) {
+    ((UINTN *)Buf)[i] = (UINTN)(UINTN)&StubOk;
+  }
+  Status = gBS->InstallProtocolInterface (&Handle, &mTypeCGuid, EFI_NATIVE_INTERFACE, Buf);
+  if (!EFI_ERROR (Status)) {
+    mStubProtocol = Buf;
+    Say ("TypeC STUB installed", Status, (UINT64)(UINTN)Handle);
+  } else {
+    Say ("TypeC STUB install FAILED", Status, 0);
+    FreePool (Buf);
+  }
 }
 
 STATIC
@@ -109,16 +152,11 @@ PrintAll (
 {
   Say ("---- probe ----", EFI_SUCCESS, 0);
   PrintOne ("TypeC", &mTypeCGuid);
-  PrintOne ("ChipInfo", &mChipInfoGuid);
-  PrintOne ("Clock", &mClockGuid);
-  PrintOne ("PmicVreg", &mPmicVregGuid);
-  PrintOne ("Smem", &mSmemGuid);
-  PrintOne ("PlatformInfo", &mPlatformInfoGuid);
-  PrintOne ("AcpiSdt", &mAcpiSdtGuid);
   PrintOne ("USB_CONFIG", &mUsbConfigGuid);
   PrintOne ("USBFN_IO", &mUsbfnIoGuid);
   PrintVolumes ();
   Say ("---- end ----", EFI_SUCCESS, 0);
+  (VOID)Tag;
 }
 
 STATIC
@@ -130,50 +168,31 @@ HeartbeatCallback (
   )
 {
   mBeatCount++;
-  AsciiPrint ("UsbProbe: HB %u\n", mBeatCount);
-  DEBUG ((DEBUG_ERROR, "UsbProbe: HB %u\n", mBeatCount));
+  AsciiPrint (">>> UsbProbe: HB %u\n", mBeatCount);
+  DEBUG ((DEBUG_ERROR, ">>> UsbProbe: HB %u\n", mBeatCount));
+
+  PrintOne ("TypeC", &mTypeCGuid);
+  PrintVolumes ();
+
   if ((mBeatCount % 3) == 0) {
-    PrintOne ("  USB_CONFIG", &mUsbConfigGuid);
-    PrintOne ("  USBFN_IO", &mUsbfnIoGuid);
-    PrintVolumes ();
+    PrintOne ("USB_CONFIG", &mUsbConfigGuid);
+    PrintOne ("USBFN_IO", &mUsbfnIoGuid);
   }
+
+  if ((mBeatCount >= 5) && (mBeatCount <= 8) && !mStartTried) {
+    if (mBeatCount == 5 || mBeatCount == 6) {
+      TryStartController (8); /* 8 -> device mode(1) */
+    } else {
+      TryStartController (1); /* 1 -> mode 1 */
+    }
+    if (mBeatCount == 8) {
+      mStartTried = TRUE;
+    }
+  }
+
   if (mBeatCount >= HEARTBEAT_MAX) {
     gBS->CloseEvent (Event);
   }
-}
-
-STATIC
-EFI_STATUS
-InstallStub (
-  IN EFI_GUID    *Guid,
-  IN CONST CHAR8 *Name
-  )
-{
-  EFI_STATUS  Status;
-  EFI_HANDLE  Handle = NULL;
-  UINT8       *Buf;
-  UINTN       i;
-
-  if (mStubProtocol != NULL) {
-    return EFI_SUCCESS;
-  }
-
-  Buf = AllocateZeroPool (0x100);
-  if (Buf == NULL) {
-    return EFI_OUT_OF_RESOURCES;
-  }
-  for (i = 0; i < 0x100 / sizeof (UINTN); i++) {
-    ((UINTN *)Buf)[i] = (UINTN)(UINTN)&StubFunction;
-  }
-  Status = gBS->InstallProtocolInterface (&Handle, Guid, EFI_NATIVE_INTERFACE, Buf);
-  if (!EFI_ERROR (Status)) {
-    mStubProtocol = Buf;
-    Say (Name, Status, (UINT64)(UINTN)Handle);
-  } else {
-    Say (Name, Status, 0);
-    FreePool (Buf);
-  }
-  return Status;
 }
 
 EFI_STATUS
@@ -187,12 +206,12 @@ UsbProbeEntry (
   VOID        *Ifc = NULL;
 
   Say ("=== UsbProbeDxe entry ===", EFI_SUCCESS, 0);
-  AsciiPrint ("UsbProbe: build v5 (heartbeat + fs volume list)\n");
+  AsciiPrint (">>> UsbProbe build v6 (stub=SUCCESS, heartbeat, force StartController)\n");
 
   Status = gBS->LocateProtocol (&mTypeCGuid, NULL, &Ifc);
   if (EFI_ERROR (Status)) {
     Say ("TypeC NOT found -> install stub", Status, 0);
-    InstallStub (&mTypeCGuid, "STUB installed");
+    InstallStub ();
     Ifc = NULL;
     Status = gBS->LocateProtocol (&mTypeCGuid, NULL, &Ifc);
     Say ("after stub: TypeC", Status, (UINT64)(UINTN)Ifc);
