@@ -100,11 +100,11 @@
     SECTION PE32 = Platform/EFI_Binaries/Drivers/sdm660/UsbDeviceDxe/UsbDeviceDxe.efi
     SECTION UI = "UsbDeviceDxe"
   }
-  FILE DRIVER = cd823a4d-7dec-4531-ae5d-4134fa4127b8 {
-    SECTION DXE_DEPEX = Platform/EFI_Binaries/Drivers/sdm660/UsbConfigDxe/UsbConfigDxe.depex
-    SECTION PE32 = Platform/EFI_Binaries/Drivers/sdm660/UsbConfigDxe/UsbConfigDxe.efi
-    SECTION UI = "UsbConfigDxe"
-  }
+  #FILE DRIVER = cd823a4d-7dec-4531-ae5d-4134fa4127b8 {
+    #SECTION DXE_DEPEX = Platform/EFI_Binaries/Drivers/sdm660/UsbConfigDxe/UsbConfigDxe.depex
+    #SECTION PE32 = Platform/EFI_Binaries/Drivers/sdm660/UsbConfigDxe/UsbConfigDxe.efi
+    #SECTION UI = "UsbConfigDxe"
+  #}
 
   FILE DRIVER = 0d35cd8e-97ea-4f9a-96af-0f0d89f76567 {
     SECTION DXE_DEPEX = Platform/EFI_Binaries/Drivers/sdm660/UFSDxe/UFSDxe.depex
