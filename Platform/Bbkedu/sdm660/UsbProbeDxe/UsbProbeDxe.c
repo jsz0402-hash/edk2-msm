@@ -1,13 +1,14 @@
 /** @file
-  h7000 USB 诊断/修复驱动 (v8) - 输出保证可见版:
-  * 所有提示都通过 "找到的所有 SimpleTextOutput 协议 + gST->ConOut" 直接写屏,
-    同时再用 DEBUG/AsciiPrint 兜底 -> RELEASE 构建也能看到;
-  * 第一行无条件打印 ">>> PROBE: entry reached" (用来判断驱动是否被 dispatch);
-  * 装 USB Type-C protocol 桩 (所有方法返回 EFI_SUCCESS);
-  * 心跳 STAT 页: TypeC / USB_CONFIG / USBFN_IO / volumes(fs) / StartController 返回码;
-  * 自动尝试打开每个卷上的 \EFI\hakios\payload.bin 并打印 大小 + 前 16 字节;
-  * 心跳第 5~8 拍强制调 USB_CONFIG->StartController(core=0, connType=8/1).
-  (本设备无可用键盘, 一切信息必须自动上屏.)
+  h7000 USB 诊断/修复驱动 (v9) —— 屏幕存活信道版
+  * 心跳里直接往 GOP framebuffer 画色块(不依赖 Console, 拍一张照片即可读出状态):
+      红块 = probe 在跑 (执行到心跳)
+      绿块 = Type-C 桩已装上
+      蓝块 = StartController 返回成功
+      白格 = 心跳计数 (最多 10 格)
+  * Console 可用时同时打印 STAT 页 / volumes / payload / StartController 返回码;
+  * 强制 Type-C 桩(方法都返回 EFI_SUCCESS);
+  * 心跳第 5~8 拍尝试 USB_CONFIG->StartController(core=0, connType=8/1).
+  本设备无键盘, 所有信息必须自动上屏.
 **/
 #include <Uefi.h>
 #include <Library/UefiBootServicesTableLib.h>
@@ -17,17 +18,24 @@
 #include <Library/MemoryAllocationLib.h>
 #include <Library/PrintLib.h>
 #include <Library/DebugLib.h>
+#include <Protocol/GraphicsOutput.h>
 #include <Protocol/SimpleFileSystem.h>
 #include <Protocol/SimpleTextOut.h>
 #include <Guid/FileInfo.h>
 
-#define HEARTBEAT_MAX 120
+#define HEARTBEAT_MAX 240
+#define BAR_W         120
+#define BAR_H         10
+#define BAR_GAP       14
 
-STATIC EFI_EVENT  mHeartbeatEvent;
-STATIC UINTN      mBeatCount;
-STATIC BOOLEAN    mStartTried;
-STATIC EFI_STATUS mStartStatus = EFI_NOT_STARTED;
-STATIC CHAR8      mLine[320];
+STATIC EFI_EVENT        mHeartbeatEvent;
+STATIC UINTN            mBeatCount;
+STATIC BOOLEAN          mStartTried;
+STATIC EFI_STATUS       mStartStatus = EFI_NOT_STARTED;
+STATIC EFI_GRAPHICS_OUTPUT_PROTOCOL  *mGop = NULL;
+STATIC BOOLEAN          mStubInstalled = FALSE;
+STATIC VOID             *mStubProtocol = NULL;
+STATIC CHAR8            mLine[320];
 
 STATIC EFI_GUID mTypeCGuid = { 0x6adb9972, 0x083d, 0x4be4,
                                { 0xbb, 0x74, 0xc7, 0x25, 0xa7, 0x30, 0x61, 0x56 } };
@@ -37,10 +45,6 @@ STATIC EFI_GUID mUsbfnIoGuid = { 0x32d2963a, 0xfe5d, 0x4f30,
                                  { 0xb6, 0x33, 0x6e, 0x5d, 0xc5, 0x58, 0x03, 0xcc } };
 STATIC EFI_GUID mSfsGuid = { 0x964e5b22, 0x6459, 0x11d2,
                              { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } };
-STATIC EFI_GUID mTextOutGuid = { 0x387477c2, 0x69c7, 0x11d2,
-                                 { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } };
-
-STATIC VOID *mStubProtocol = NULL;
 
 STATIC
 EFI_STATUS
@@ -52,35 +56,85 @@ StubOk (
   return EFI_SUCCESS;
 }
 
-/* 把一行 ASCII 文本写到所有能找到的 SimpleTextOutput (外加 ConOut 兜底) */
+/* ---------------- 屏幕信道: GOP 画色块 ---------------- */
+STATIC
+VOID
+DrawBar (
+  IN UINTN  X,
+  IN UINTN  Y,
+  IN UINTN  Width,
+  IN UINTN  Height,
+  IN UINT8  R,
+  IN UINT8  G,
+  IN UINT8  B
+  )
+{
+  EFI_STATUS                      Status;
+  EFI_GRAPHICS_OUTPUT_BLT_PIXEL   *Buf;
+  EFI_GRAPHICS_OUTPUT_BLT_PIXEL   Pixel;
+  UINTN                           i;
+
+  if (mGop == NULL) {
+    return;
+  }
+  if ((X + Width > mGop->Mode->Info->HorizontalResolution) ||
+      (Y + Height > mGop->Mode->Info->VerticalResolution)) {
+    return;
+  }
+  Buf = AllocateZeroPool (Width * Height * sizeof (EFI_GRAPHICS_OUTPUT_BLT_PIXEL));
+  if (Buf == NULL) {
+    return;
+  }
+  Pixel.Blue  = B;
+  Pixel.Green = G;
+  Pixel.Red   = R;
+  Pixel.Reserved = 0;
+  for (i = 0; i < Width * Height; i++) {
+    Buf[i] = Pixel;
+  }
+  Status = mGop->Blt (mGop, Buf, EfiBltBufferToVideo,
+                      0, 0, (UINTN)X, (UINTN)Y, Width, Height, 0);
+  FreePool (Buf);
+  (VOID)Status;
+}
+
+/* 顶部状态条: 红=活着 绿=TypeC桩 蓝=StartController成功 白格=心跳 */
+STATIC
+VOID
+DrawStatus (
+  VOID
+  )
+{
+  UINTN  i;
+
+  if (mGop == NULL) {
+    return;
+  }
+  DrawBar (8, 8, BAR_W, BAR_H, 0xFF, 0x00, 0x00);                 /* 红: probe 活着 */
+  if (mStubInstalled) {
+    DrawBar (8 + BAR_W + BAR_GAP, 8, BAR_W, BAR_H, 0x00, 0xFF, 0x00);   /* 绿 */
+  }
+  if (!EFI_ERROR (mStartStatus)) {
+    DrawBar (8 + 2 * (BAR_W + BAR_GAP), 8, BAR_W, BAR_H, 0x00, 0x00, 0xFF); /* 蓝 */
+  }
+  for (i = 0; (i < mBeatCount) && (i < 10); i++) {
+    DrawBar (8 + 3 * (BAR_W + BAR_GAP) + i * 12, 8, 8, BAR_H, 0xFF, 0xFF, 0xFF);
+  }
+}
+
+/* ---------------- Console 输出 (仅在确实可用时) ---------------- */
 STATIC
 VOID
 OutLine (
   IN CONST CHAR8  *Ascii
   )
 {
-  CHAR16      Uni[512];
-  EFI_STATUS  Status;
-  EFI_HANDLE  *Handles = NULL;
-  UINTN       Count = 0;
-  UINTN       i;
+  CHAR16  Uni[512];
 
   AsciiStrToUnicodeStrS (Ascii, Uni, ARRAY_SIZE (Uni));
-
-  Status = gBS->LocateHandleBuffer (ByProtocol, &mTextOutGuid, NULL, &Count, &Handles);
-  if (!EFI_ERROR (Status) && (Handles != NULL)) {
-    for (i = 0; i < Count; i++) {
-      EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL  *TextOut = NULL;
-      if (!EFI_ERROR (gBS->HandleProtocol (Handles[i], &mTextOutGuid, (VOID **)&TextOut)) && (TextOut != NULL)) {
-        TextOut->OutputString (TextOut, Uni);
-      }
-    }
-    FreePool (Handles);
-  } else if ((gST != NULL) && (gST->ConOut != NULL)) {
+  if ((gST != NULL) && (gST->ConOut != NULL) && (gST->ConOut->Mode != NULL)) {
     gST->ConOut->OutputString (gST->ConOut, Uni);
   }
-
-  /* 兜底: 早期 ConOut 未就绪时 DEBUG 可能通过串口/帧缓存可见 */
   DEBUG ((DEBUG_ERROR, "%a", Ascii));
 }
 
@@ -96,6 +150,39 @@ Say (
   OutLine (mLine);
 }
 
+/* ---------------- 桩 ---------------- */
+STATIC
+VOID
+InstallStub (
+  VOID
+  )
+{
+  EFI_STATUS  Status;
+  EFI_HANDLE  Handle = NULL;
+  UINT8       *Buf;
+  UINTN       i;
+
+  if (mStubProtocol != NULL) {
+    return;
+  }
+  Buf = AllocateZeroPool (0x100);
+  if (Buf == NULL) {
+    return;
+  }
+  for (i = 0; i < 0x100 / sizeof (UINTN); i++) {
+    ((UINTN *)Buf)[i] = (UINTN)(UINTN)&StubOk;
+  }
+  Status = gBS->InstallProtocolInterface (&Handle, &mTypeCGuid, EFI_NATIVE_INTERFACE, Buf);
+  if (!EFI_ERROR (Status)) {
+    mStubProtocol = Buf;
+    mStubInstalled = TRUE;
+  } else {
+    FreePool (Buf);
+  }
+  Say ("TypeC STUB install", Status, (UINT64)(UINTN)Handle);
+}
+
+/* ---------------- 状态查询 ---------------- */
 STATIC
 VOID
 PrintVolumes (
@@ -127,43 +214,38 @@ CheckPayload (
   EFI_HANDLE  *Handles = NULL;
   UINTN       Count = 0;
   UINTN       i;
-  UINTN       j;
   UINT8       Head[16];
   UINTN       HeadSize;
+  EFI_FILE_INFO  *Info;
+  UINTN       InfoSize;
+  UINT64      FileSize;
 
   Status = gBS->LocateHandleBuffer (ByProtocol, &mSfsGuid, NULL, &Count, &Handles);
   if (EFI_ERROR (Status) || (Handles == NULL)) {
-    AsciiSPrint (mLine, sizeof (mLine), ">>> PAYLOAD: no volumes (%r)\n", Status);
-    OutLine (mLine);
+    Say ("payload: no volumes", Status, 0);
     return;
   }
-
   for (i = 0; (i < Count) && (i < 4); i++) {
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL  *Sfs = NULL;
     EFI_FILE_PROTOCOL                *Root = NULL;
     EFI_FILE_PROTOCOL                *File = NULL;
-    EFI_FILE_INFO                    *Info = NULL;
-    UINTN                            InfoSize = 0;
-    UINT64                           FileSize = 0;
-    EFI_STATUS                       OpenStatus;
+    EFI_STATUS                        OpenStatus;
 
     Status = gBS->HandleProtocol (Handles[i], &mSfsGuid, (VOID **)&Sfs);
     if (EFI_ERROR (Status) || (Sfs == NULL)) {
-      AsciiSPrint (mLine, sizeof (mLine), ">>> PAYLOAD vol%u: no SFS (%r)\n", i, Status);
-      OutLine (mLine);
       continue;
     }
     Status = Sfs->OpenVolume (Sfs, &Root);
     if (EFI_ERROR (Status) || (Root == NULL)) {
-      AsciiSPrint (mLine, sizeof (mLine), ">>> PAYLOAD vol%u: OpenVolume failed (%r)\n", i, Status);
-      OutLine (mLine);
       continue;
     }
-
     OpenStatus = Root->Open (Root, &File, L"\\EFI\\hakios\\payload.bin", EFI_FILE_MODE_READ, 0);
-    AsciiSPrint (mLine, sizeof (mLine), ">>> PAYLOAD vol%u: open payload.bin = %r\n", i, OpenStatus);
+    AsciiSPrint (mLine, sizeof (mLine), ">>> PAYLOAD vol%u open=%r\n", (UINT32)i, OpenStatus);
     OutLine (mLine);
     if (!EFI_ERROR (OpenStatus) && (File != NULL)) {
+      Info = NULL;
+      InfoSize = 0;
+      FileSize = 0;
       Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, NULL);
       if (Status == EFI_BUFFER_TOO_SMALL) {
         Info = AllocateZeroPool (InfoSize);
@@ -175,22 +257,21 @@ CheckPayload (
           FreePool (Info);
         }
       }
-      AsciiSPrint (mLine, sizeof (mLine), ">>> PAYLOAD vol%u: size=%lu (%r)\n", i, FileSize, Status);
+      AsciiSPrint (mLine, sizeof (mLine), ">>> PAYLOAD vol%u size=%lu (%r)\n", (UINT32)i, FileSize, Status);
       OutLine (mLine);
-
       HeadSize = sizeof (Head);
       ZeroMem (Head, sizeof (Head));
       Status = File->Read (File, &HeadSize, Head);
       if (!EFI_ERROR (Status) && (HeadSize > 0)) {
-        AsciiSPrint (mLine, sizeof (mLine), ">>> PAYLOAD vol%u: head(%u):", i, (UINT32)HeadSize);
+        AsciiSPrint (mLine, sizeof (mLine), ">>> PAYLOAD head(%u):", (UINT32)HeadSize);
         OutLine (mLine);
-        for (j = 0; j < HeadSize; j++) {
-          AsciiSPrint (mLine, sizeof (mLine), ">>>   byte[%u] = 0x%02x\n", (UINT32)j, Head[j]);
-          OutLine (mLine);
+        {
+          UINTN j;
+          for (j = 0; j < HeadSize; j++) {
+            AsciiSPrint (mLine, sizeof (mLine), ">>>   b[%u]=0x%02x\n", (UINT32)j, Head[j]);
+            OutLine (mLine);
+          }
         }
-      } else {
-        AsciiSPrint (mLine, sizeof (mLine), ">>> PAYLOAD vol%u: read head failed (%r)\n", i, Status);
-        OutLine (mLine);
       }
       File->Close (File);
     }
@@ -226,73 +307,7 @@ TryStartController (
   mStartStatus = Status;
 }
 
-STATIC
-VOID
-PrintStat (
-  VOID
-  )
-{
-  VOID        *TypeC = NULL;
-  VOID        *UsbCfg = NULL;
-  VOID        *UsbFn = NULL;
-  UINTN       VolCount = 0;
-  EFI_HANDLE  *Handles = NULL;
-
-  gBS->LocateProtocol (&mTypeCGuid, NULL, &TypeC);
-  gBS->LocateProtocol (&mUsbConfigGuid, NULL, &UsbCfg);
-  gBS->LocateProtocol (&mUsbfnIoGuid, NULL, &UsbFn);
-  if (!EFI_ERROR (gBS->LocateHandleBuffer (ByProtocol, &mSfsGuid, NULL, &VolCount, &Handles))) {
-    if (Handles != NULL) {
-      FreePool (Handles);
-    }
-  } else {
-    VolCount = 0;
-  }
-
-  OutLine (">>> =============== STAT ===============\n");
-  AsciiSPrint (mLine, sizeof (mLine), ">>> STAT TypeC=%a USB_CONFIG=%a USBFN_IO=%a\n",
-               (TypeC != NULL) ? "OK" : "NO",
-               (UsbCfg != NULL) ? "OK" : "NO",
-               (UsbFn != NULL) ? "OK" : "NO");
-  OutLine (mLine);
-  AsciiSPrint (mLine, sizeof (mLine), ">>> STAT volumes(fs)=%u\n", VolCount);
-  OutLine (mLine);
-  AsciiSPrint (mLine, sizeof (mLine), ">>> STAT StartController=%r\n", mStartStatus);
-  OutLine (mLine);
-  OutLine (">>> =====================================\n");
-}
-
-STATIC
-VOID
-InstallStub (
-  VOID
-  )
-{
-  EFI_STATUS  Status;
-  EFI_HANDLE  Handle = NULL;
-  UINT8       *Buf;
-  UINTN       i;
-
-  if (mStubProtocol != NULL) {
-    return;
-  }
-  Buf = AllocateZeroPool (0x100);
-  if (Buf == NULL) {
-    return;
-  }
-  for (i = 0; i < 0x100 / sizeof (UINTN); i++) {
-    ((UINTN *)Buf)[i] = (UINTN)(UINTN)&StubOk;
-  }
-  Status = gBS->InstallProtocolInterface (&Handle, &mTypeCGuid, EFI_NATIVE_INTERFACE, Buf);
-  if (!EFI_ERROR (Status)) {
-    mStubProtocol = Buf;
-    Say ("TypeC STUB installed", Status, (UINT64)(UINTN)Handle);
-  } else {
-    Say ("TypeC STUB install FAILED", Status, 0);
-    FreePool (Buf);
-  }
-}
-
+/* ---------------- 心跳 ---------------- */
 STATIC
 VOID
 EFIAPI
@@ -302,8 +317,20 @@ HeartbeatCallback (
   )
 {
   mBeatCount++;
-  AsciiSPrint (mLine, sizeof (mLine), ">>> PROBE: HB %u\n", mBeatCount);
-  OutLine (mLine);
+
+  if (mGop == NULL) {
+    EFI_STATUS  Status = gBS->LocateProtocol (&gEfiGraphicsOutputProtocolGuid, NULL, (VOID **)&mGop);
+    if (EFI_ERROR (Status)) {
+      mGop = NULL;
+    }
+  }
+
+  DrawStatus ();
+
+  if (mBeatCount == 1) {
+    Say ("=== PROBE v9 alive ===", EFI_SUCCESS, 0);
+    PrintVolumes ();
+  }
 
   if ((mBeatCount >= 5) && (mBeatCount <= 8) && !mStartTried) {
     TryStartController ((mBeatCount <= 6) ? 8 : 1);
@@ -312,8 +339,19 @@ HeartbeatCallback (
     }
   }
 
-  if ((mBeatCount == 9) || (mBeatCount == 15) || (mBeatCount == 30) || (mBeatCount == 60)) {
-    PrintStat ();
+  if ((mBeatCount == 10) || (mBeatCount == 20) || (mBeatCount == 40)) {
+    Say ("STAT TypeC/USB_CONFIG/USBFN_IO", EFI_SUCCESS, 0);
+    {
+      VOID  *A = NULL;
+      VOID  *B = NULL;
+      VOID  *C = NULL;
+      gBS->LocateProtocol (&mTypeCGuid, NULL, &A);
+      gBS->LocateProtocol (&mUsbConfigGuid, NULL, &B);
+      gBS->LocateProtocol (&mUsbfnIoGuid, NULL, &C);
+      AsciiSPrint (mLine, sizeof (mLine), ">>> STAT TypeC=%a USB_CONFIG=%a USBFN_IO=%a\n",
+                   (A != NULL) ? "OK" : "NO", (B != NULL) ? "OK" : "NO", (C != NULL) ? "OK" : "NO");
+      OutLine (mLine);
+    }
     CheckPayload ();
   }
 
@@ -333,8 +371,12 @@ UsbProbeEntry (
   EFI_STATUS  Status;
   VOID        *Ifc = NULL;
 
-  /* 第一行无条件打印: 判断驱动是否真的被 dispatch */
-  OutLine (">>> PROBE: entry reached (UsbProbeDxe v8)\n");
+  OutLine (">>> PROBE: entry reached (UsbProbeDxe v9)\n");
+
+  if (mGop == NULL) {
+    gBS->LocateProtocol (&gEfiGraphicsOutputProtocolGuid, NULL, (VOID **)&mGop);
+  }
+  DrawBar (8, 8, BAR_W, BAR_H, 0xFF, 0x00, 0x00);   /* 立即画红块: 证明 entry 跑了 */
 
   Status = gBS->LocateProtocol (&mTypeCGuid, NULL, &Ifc);
   if (EFI_ERROR (Status)) {
@@ -346,12 +388,12 @@ UsbProbeEntry (
   } else {
     Say ("TypeC found", Status, (UINT64)(UINTN)Ifc);
   }
-
-  Say ("---- early probe ----", EFI_SUCCESS, 0);
-  PrintVolumes ();
+  if (mStubInstalled && (mGop != NULL)) {
+    DrawBar (8 + BAR_W + BAR_GAP, 8, BAR_W, BAR_H, 0x00, 0xFF, 0x00);
+  }
 
   if (!EFI_ERROR (gBS->CreateEvent (EVT_TIMER, TPL_CALLBACK, HeartbeatCallback, NULL, &mHeartbeatEvent))) {
-    gBS->SetTimer (mHeartbeatEvent, TimerPeriodic, 10000000ULL); /* 1s */
+    gBS->SetTimer (mHeartbeatEvent, TimerPeriodic, 5000000ULL); /* 0.5s */
   }
 
   return EFI_SUCCESS;
