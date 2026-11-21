@@ -102,7 +102,7 @@
   }
   FILE DRIVER = cd823a4d-7dec-4531-ae5d-4134fa4127b8 {
     SECTION DXE_DEPEX = Platform/EFI_Binaries/Drivers/sdm660/UsbConfigDxe/UsbConfigDxe.depex
-    SECTION PE32 = Platform/EFI_Binaries/Drivers/sdm660/UsbConfigDxe/UsbConfigDxe.efi
+    SECTION PE32 = Platform/Bbkedu/sdm660/PatchedBinaries/UsbConfigDxe.efi
     SECTION UI = "UsbConfigDxe"
   }
 
