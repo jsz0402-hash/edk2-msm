@@ -1,9 +1,13 @@
 /** @file
-  诊断/修复驱动 (v6):
-  1. 装 USB Type-C protocol 桩 (所有方法返回 EFI_SUCCESS);
-  2. 心跳打印 (>>> 前缀): Type-C / USB_CONFIG / USBFN_IO / FS 卷数量;
-  3. 心跳第 5 拍开始尝试调用 USB_CONFIG->StartController(core=0, connType=8/1)
-     强制启动 device 模式 (mode 1 = device), 打印返回状态.
+  诊断/修复驱动 (v7):
+  1. 装 USB Type-C protocol 桩 (所有方法返回 EFI_SUCCESS) - 防止 vendor 空指针/失败退出;
+  2. 心跳 (>>> 前缀), 定时打印 STAT 诊断块:
+       STAT TypeC/USB_CONFIG/USBFN_IO 是否存在;
+       STAT volumes(fs) = N;
+       STAT StartController = 返回码;
+       STAT payload(\EFI\hakios\payload.bin) = 打开结果/大小/前16字节;
+  3. 心跳第 5 拍起尝试 USB_CONFIG->StartController(core=0, connType=8/1) 强制 device 模式.
+  所有信息自动打印到屏幕 (本设备没有可用键盘, 不能依赖 Shell 输入).
 **/
 #include <Uefi.h>
 #include <Library/UefiBootServicesTableLib.h>
@@ -12,12 +16,15 @@
 #include <Library/BaseMemoryLib.h>
 #include <Library/MemoryAllocationLib.h>
 #include <Library/DebugLib.h>
+#include <Protocol/SimpleFileSystem.h>
+#include <Guid/FileInfo.h>
 
-#define HEARTBEAT_MAX 90
+#define HEARTBEAT_MAX 120
 
 STATIC EFI_EVENT mHeartbeatEvent;
 STATIC UINTN     mBeatCount;
 STATIC BOOLEAN   mStartTried;
+STATIC EFI_STATUS mStartStatus = EFI_NOT_STARTED;
 
 STATIC EFI_GUID mTypeCGuid = { 0x6adb9972, 0x083d, 0x4be4,
                                { 0xbb, 0x74, 0xc7, 0x25, 0xa7, 0x30, 0x61, 0x56 } };
@@ -54,21 +61,6 @@ Say (
 
 STATIC
 VOID
-PrintOne (
-  IN CONST CHAR8 *Name,
-  IN EFI_GUID    *Guid
-  )
-{
-  VOID       *Ifc = NULL;
-  EFI_STATUS  Status;
-
-  Status = gBS->LocateProtocol (Guid, NULL, &Ifc);
-  Say (Name, Status, (UINT64)(UINTN)Ifc);
-  return;
-}
-
-STATIC
-VOID
 PrintVolumes (
   VOID
   )
@@ -88,6 +80,82 @@ PrintVolumes (
   }
 }
 
+/* 自动尝试打开每个卷上的 \EFI\hakios\payload.bin, 打印结果/大小/前 16 字节 */
+STATIC
+VOID
+CheckPayload (
+  VOID
+  )
+{
+  EFI_STATUS  Status;
+  EFI_HANDLE  *Handles = NULL;
+  UINTN       Count = 0;
+  UINTN       i;
+  UINTN       j;
+  UINT8       Head[16];
+  UINTN       HeadSize;
+
+  Status = gBS->LocateHandleBuffer (ByProtocol, &mSfsGuid, NULL, &Count, &Handles);
+  if (EFI_ERROR (Status) || (Handles == NULL)) {
+    AsciiPrint (">>> PAYLOAD: no volumes (%r)\n", Status);
+    return;
+  }
+
+  for (i = 0; (i < Count) && (i < 4); i++) {
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL  *Sfs = NULL;
+    EFI_FILE_PROTOCOL                *Root = NULL;
+    EFI_FILE_PROTOCOL                *File = NULL;
+    EFI_FILE_INFO                    *Info = NULL;
+    UINTN                            InfoSize = 0;
+    UINT64                           FileSize = 0;
+    EFI_STATUS                       OpenStatus;
+
+    Status = gBS->HandleProtocol (Handles[i], &mSfsGuid, (VOID **)&Sfs);
+    if (EFI_ERROR (Status) || (Sfs == NULL)) {
+      AsciiPrint (">>> PAYLOAD vol%u: no SFS (%r)\n", i, Status);
+      continue;
+    }
+    Status = Sfs->OpenVolume (Sfs, &Root);
+    if (EFI_ERROR (Status) || (Root == NULL)) {
+      AsciiPrint (">>> PAYLOAD vol%u: OpenVolume failed (%r)\n", i, Status);
+      continue;
+    }
+
+    OpenStatus = Root->Open (Root, &File, L"\\EFI\\hakios\\payload.bin", EFI_FILE_MODE_READ, 0);
+    AsciiPrint (">>> PAYLOAD vol%u: open \\EFI\\hakios\\payload.bin = %r\n", i, OpenStatus);
+    if (!EFI_ERROR (OpenStatus) && (File != NULL)) {
+      Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, NULL);
+      if (Status == EFI_BUFFER_TOO_SMALL) {
+        Info = AllocateZeroPool (InfoSize);
+        if (Info != NULL) {
+          Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
+          if (!EFI_ERROR (Status)) {
+            FileSize = Info->FileSize;
+          }
+          FreePool (Info);
+        }
+      }
+      AsciiPrint (">>> PAYLOAD vol%u: size=%lu (%r)\n", i, FileSize, Status);
+
+      HeadSize = sizeof (Head);
+      ZeroMem (Head, sizeof (Head));
+      Status = File->Read (File, &HeadSize, Head);
+      if (!EFI_ERROR (Status) && (HeadSize > 0)) {
+        AsciiPrint (">>> PAYLOAD vol%u: first %u bytes:", i, (UINT32)HeadSize);
+        for (j = 0; j < HeadSize; j++) {
+          AsciiPrint (" %02x", Head[j]);
+        }
+        AsciiPrint ("\n");
+      } else {
+        AsciiPrint (">>> PAYLOAD vol%u: read head failed (%r)\n", i, Status);
+      }
+      File->Close (File);
+    }
+    Root->Close (Root);
+  }
+  FreePool (Handles);
+}
+
 /* 尝试用 USB_CONFIG 协议的 StartController 强制启动 device 模式 */
 STATIC
 VOID
@@ -102,15 +170,53 @@ TryStartController (
   Status = gBS->LocateProtocol (&mUsbConfigGuid, NULL, &Ifc);
   if (EFI_ERROR (Status) || Ifc == NULL) {
     Say ("StartController: no USB_CONFIG", Status, 0);
+    mStartStatus = Status;
     return;
   }
-  Func = ((UINTN *)Ifc)[10]; /* vtable offset 0x50 = StartController */
+  Func = ((UINTN *)Ifc)[10]; /* vtable offset 0x50 = UsbConfigStartController */
   Say ("StartController->vtable[10]", EFI_SUCCESS, (UINT64)Func);
   if (Func == 0) {
+    mStartStatus = EFI_UNSUPPORTED;
     return;
   }
   Status = ((EFI_STATUS (EFIAPI *)(VOID *, UINT32, UINT32))Func)(Ifc, 0, ConnType);
   Say ("StartController(0,connType)", Status, ConnType);
+  mStartStatus = Status;
+}
+
+STATIC
+VOID
+PrintStat (
+  VOID
+  )
+{
+  EFI_STATUS  Status;
+  VOID        *TypeC = NULL;
+  VOID        *UsbCfg = NULL;
+  VOID        *UsbFn = NULL;
+  UINTN       VolCount = 0;
+  EFI_HANDLE  *Handles = NULL;
+
+  Status = gBS->LocateProtocol (&mTypeCGuid, NULL, &TypeC);
+  Status = gBS->LocateProtocol (&mUsbConfigGuid, NULL, &UsbCfg);
+  Status = gBS->LocateProtocol (&mUsbfnIoGuid, NULL, &UsbFn);
+  if (!EFI_ERROR (gBS->LocateHandleBuffer (ByProtocol, &mSfsGuid, NULL, &VolCount, &Handles))) {
+    if (Handles != NULL) {
+      FreePool (Handles);
+    }
+  } else {
+    VolCount = 0;
+  }
+
+  AsciiPrint (">>> ================ STAT ================\n");
+  AsciiPrint (">>> STAT TypeC=%a USB_CONFIG=%a USBFN_IO=%a\n",
+              (TypeC != NULL) ? "OK" : "NO",
+              (UsbCfg != NULL) ? "OK" : "NO",
+              (UsbFn != NULL) ? "OK" : "NO");
+  AsciiPrint (">>> STAT volumes(fs)=%u\n", VolCount);
+  AsciiPrint (">>> STAT StartController=%r\n", mStartStatus);
+  AsciiPrint (">>> ======================================\n");
+  (VOID)Status;
 }
 
 STATIC
@@ -151,9 +257,7 @@ PrintAll (
   )
 {
   Say ("---- probe ----", EFI_SUCCESS, 0);
-  PrintOne ("TypeC", &mTypeCGuid);
-  PrintOne ("USB_CONFIG", &mUsbConfigGuid);
-  PrintOne ("USBFN_IO", &mUsbfnIoGuid);
+  Say ("TypeC", (mStubProtocol != NULL) ? EFI_SUCCESS : EFI_NOT_FOUND, (UINT64)(UINTN)mStubProtocol);
   PrintVolumes ();
   Say ("---- end ----", EFI_SUCCESS, 0);
   (VOID)Tag;
@@ -171,28 +275,22 @@ HeartbeatCallback (
   AsciiPrint (">>> UsbProbe: HB %u\n", mBeatCount);
   DEBUG ((DEBUG_ERROR, ">>> UsbProbe: HB %u\n", mBeatCount));
 
-  PrintOne ("TypeC", &mTypeCGuid);
-  PrintVolumes ();
-
-  if ((mBeatCount % 3) == 0) {
-    PrintOne ("USB_CONFIG", &mUsbConfigGuid);
-    PrintOne ("USBFN_IO", &mUsbfnIoGuid);
-  }
-
   if ((mBeatCount >= 5) && (mBeatCount <= 8) && !mStartTried) {
-    if (mBeatCount == 5 || mBeatCount == 6) {
-      TryStartController (8); /* 8 -> device mode(1) */
-    } else {
-      TryStartController (1); /* 1 -> mode 1 */
-    }
+    TryStartController ((mBeatCount <= 6) ? 8 : 1);
     if (mBeatCount == 8) {
       mStartTried = TRUE;
     }
   }
 
+  if ((mBeatCount == 9) || (mBeatCount == 15) || (mBeatCount == 30) || (mBeatCount == 60)) {
+    PrintStat ();
+    CheckPayload ();
+  }
+
   if (mBeatCount >= HEARTBEAT_MAX) {
     gBS->CloseEvent (Event);
   }
+  (VOID)Context;
 }
 
 EFI_STATUS
@@ -206,7 +304,7 @@ UsbProbeEntry (
   VOID        *Ifc = NULL;
 
   Say ("=== UsbProbeDxe entry ===", EFI_SUCCESS, 0);
-  AsciiPrint (">>> UsbProbe build v6 (stub=SUCCESS, heartbeat, force StartController)\n");
+  AsciiPrint (">>> UsbProbe build v7 (STAT page + payload check + force StartController)\n");
 
   Status = gBS->LocateProtocol (&mTypeCGuid, NULL, &Ifc);
   if (EFI_ERROR (Status)) {
