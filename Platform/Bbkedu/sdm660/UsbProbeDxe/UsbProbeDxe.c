@@ -59,7 +59,7 @@ OutLine (
   IN CONST CHAR8  *Ascii
   )
 {
-  CHAR16      Uni[CFG_MAXIMUM_ASCII_STRING_LENGTH];
+  CHAR16      Uni[512];
   EFI_STATUS  Status;
   EFI_HANDLE  *Handles = NULL;
   UINTN       Count = 0;

@@ -28,7 +28,7 @@
 
 [Protocols]
   gEfiSimpleFileSystemProtocolGuid
-  gEfiSimpleTextOutputProtocolGuid
+  gEfiSimpleTextOutProtocolGuid
 
 [Guids]
   gEfiFileInfoGuid
