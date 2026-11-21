@@ -133,6 +133,11 @@ READ_LOCK_STATUS   = TRUE
 
 # BSP drivers
 !include Platform/Qualcomm/sdm660/dxe.fdf.inc
+  #
+  # Stage2Dxe: stage probe (after dxe.fdf.inc include)
+  #
+  INF Platform/Bbkedu/sdm660/Stage2Dxe/Stage2Dxe.inf
+
 
   # INF Silicon/Qualcomm/sdm660/Drivers/sdm660Dxe/sdm660Dxe.inf
   INF Silicon/Qualcomm/QcomPkg/Drivers/SimpleFbDxe/SimpleFbDxe.inf
@@ -143,6 +148,11 @@ READ_LOCK_STATUS   = TRUE
   INF MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
   INF MdeModulePkg/Bus/Usb/UsbMouseDxe/UsbMouseDxe.inf
   INF MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf
+  #
+  # Stage3Dxe: stage probe (after USB host drivers)
+  #
+  INF Platform/Bbkedu/sdm660/Stage3Dxe/Stage3Dxe.inf
+
 
   #
   # FAT filesystem + GPT/MBR partitioning

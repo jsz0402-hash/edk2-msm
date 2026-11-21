@@ -1,0 +1,29 @@
+## @file
+#  阶段探针 3: 打印 STAGE3 标记
+##
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = Stage3Dxe
+  FILE_GUID                      = 6b3daf22-4e5a-4b7c-9d8f-2e3a4b5c6d7e
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = Stage3Entry
+
+[Sources]
+  Stage3Dxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  UefiLib
+  BaseLib
+  BaseMemoryLib
+  MemoryAllocationLib
+  DebugLib
+
+[Depex]
+  TRUE

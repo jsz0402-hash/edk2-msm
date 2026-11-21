@@ -1,8 +1,9 @@
 /** @file
-  诊断/修复驱动:
-  1. 打印关键 protocol 是否存在 (同时走 ConOut 和 DebugLib 两条输出路径, 便于崩溃后仍能在屏上看到);
-  2. 若 PMIC USB protocol (6adb9972-083d-4be4-bb74-c725a7306156) 缺失, 安装 stub,
-     让 UsbConfigDxe 不再空指针解引用崩溃.
+  诊断/修复驱动 (v4):
+  1. 打印关键 protocol 状态 (ConOut + DebugLib 双通道);
+  2. 若 USB Type-C protocol 缺失, 装 stub;
+  3. 周期心跳 (1s): 打印计数 + USB_CONFIG / USBFN_IO 是否存在.
+     若心跳不再打印 => 系统卡死在 DXE 调度阶段(不在 BDS 空闲).
 **/
 #include <Uefi.h>
 #include <Library/UefiBootServicesTableLib.h>
@@ -12,13 +13,14 @@
 #include <Library/MemoryAllocationLib.h>
 #include <Library/DebugLib.h>
 
-STATIC EFI_EVENT mTimerEvent;
+#define HEARTBEAT_MAX 40
 
-/* PMIC USB protocol: 6adb9972-083d-4be4-bb74-c725a7306156
- * (从 UsbConfigDxe.efi .data:0xB140 的原始字节 72 99 db 6a 3d 08 e4 4b bb 74 c7 25 a7 30 61 56 解出) */
-STATIC EFI_GUID mPmicUsbGuid = { 0x6adb9972, 0x083d, 0x4be4,
-                                 { 0xbb, 0x74, 0xc7, 0x25, 0xa7, 0x30, 0x61, 0x56 } };
-/* UsbConfigDxe depex 要求之一 */
+STATIC EFI_EVENT mHeartbeatEvent;
+STATIC UINTN     mBeatCount;
+
+/* USB Type-C protocol: 6adb9972-083d-4be4-bb74-c725a7306156 */
+STATIC EFI_GUID mTypeCGuid = { 0x6adb9972, 0x083d, 0x4be4,
+                               { 0xbb, 0x74, 0xc7, 0x25, 0xa7, 0x30, 0x61, 0x56 } };
 STATIC EFI_GUID mChipInfoGuid = { 0xb0760469, 0x970c, 0x487a,
                                   { 0xa4, 0xb5, 0x28, 0xdb, 0x7b, 0x45, 0xce, 0xf1 } };
 STATIC EFI_GUID mClockGuid = { 0x241afae6, 0x885f, 0x4f6c,
@@ -31,6 +33,10 @@ STATIC EFI_GUID mPlatformInfoGuid = { 0x157a5c45, 0x21b2, 0x43c5,
                                       { 0xba, 0x7c, 0x82, 0x2f, 0xee, 0x5f, 0xe5, 0x99 } };
 STATIC EFI_GUID mAcpiSdtGuid = { 0xeb97088e, 0xcfdf, 0x49c6,
                                  { 0xbe, 0x4b, 0xd9, 0x06, 0xa5, 0xb2, 0x0e, 0x86 } };
+STATIC EFI_GUID mUsbConfigGuid = { 0xe722b03f, 0xb250, 0x42ce,
+                                   { 0x8e, 0xbd, 0x5b, 0xd5, 0x18, 0x12, 0xd0, 0x37 } };
+STATIC EFI_GUID mUsbfnIoGuid = { 0x32d2963a, 0xfe5d, 0x4f30,
+                                 { 0xb6, 0x33, 0x6e, 0x5d, 0xc5, 0x58, 0x03, 0xcc } };
 
 STATIC VOID *mStubProtocol = NULL;
 
@@ -48,13 +54,12 @@ STATIC
 VOID
 Say (
   IN CONST CHAR8 *Text,
-  IN CONST CHAR8 *Detail,
   IN EFI_STATUS   Status,
   IN UINT64       Value
   )
 {
-  AsciiPrint ("UsbProbe: %a %a status=%r val=0x%lx\n", Text, Detail, Status, Value);
-  DEBUG ((DEBUG_ERROR, "UsbProbe: %a %a status=%r val=0x%lx\n", Text, Detail, Status, Value));
+  AsciiPrint ("UsbProbe: %a status=%r val=0x%lx\n", Text, Status, Value);
+  DEBUG ((DEBUG_ERROR, "UsbProbe: %a status=%r val=0x%lx\n", Text, Status, Value));
 }
 
 STATIC
@@ -68,7 +73,7 @@ PrintOne (
   EFI_STATUS  Status;
 
   Status = gBS->LocateProtocol (Guid, NULL, &Ifc);
-  Say (Name, "", Status, (UINT64)(UINTN)Ifc);
+  Say (Name, Status, (UINT64)(UINTN)Ifc);
 }
 
 STATIC
@@ -77,34 +82,45 @@ PrintAll (
   IN CONST CHAR8 *Tag
   )
 {
-  Say ("---- probe ----", Tag, EFI_SUCCESS, 0);
-  PrintOne ("PmicUsb", &mPmicUsbGuid);
+  Say ("---- probe ----", EFI_SUCCESS, 0);
+  PrintOne ("TypeC", &mTypeCGuid);
   PrintOne ("ChipInfo", &mChipInfoGuid);
   PrintOne ("Clock", &mClockGuid);
   PrintOne ("PmicVreg", &mPmicVregGuid);
   PrintOne ("Smem", &mSmemGuid);
   PrintOne ("PlatformInfo", &mPlatformInfoGuid);
   PrintOne ("AcpiSdt", &mAcpiSdtGuid);
-  Say ("---- end ----", Tag, EFI_SUCCESS, 0);
+  PrintOne ("USB_CONFIG", &mUsbConfigGuid);
+  PrintOne ("USBFN_IO", &mUsbfnIoGuid);
+  Say ("---- end ----", EFI_SUCCESS, 0);
 }
 
 STATIC
 VOID
 EFIAPI
-ProbeTimerCallback (
+HeartbeatCallback (
   IN EFI_EVENT Event,
   IN VOID      *Context
   )
 {
-  PrintAll ("late");
-  gBS->CloseEvent (Event);
-  mTimerEvent = NULL;
+  VOID  *Ifc;
+
+  mBeatCount++;
+  Ifc = NULL;
+  Say ("HB", EFI_SUCCESS, mBeatCount);
+  PrintOne ("  USB_CONFIG", &mUsbConfigGuid);
+  PrintOne ("  USBFN_IO", &mUsbfnIoGuid);
+  PrintOne ("  AcpiSdt", &mAcpiSdtGuid);
+  if (mBeatCount >= HEARTBEAT_MAX) {
+    gBS->CloseEvent (Event);
+  }
 }
 
 STATIC
 EFI_STATUS
-InstallStubPmicUsb (
-  VOID
+InstallStub (
+  IN EFI_GUID    *Guid,
+  IN CONST CHAR8 *Name
   )
 {
   EFI_STATUS  Status;
@@ -123,17 +139,12 @@ InstallStubPmicUsb (
   for (i = 0; i < 0x100 / sizeof (UINTN); i++) {
     ((UINTN *)Buf)[i] = (UINTN)(UINTN)&StubFunction;
   }
-  Status = gBS->InstallProtocolInterface (
-                  &Handle,
-                  &mPmicUsbGuid,
-                  EFI_NATIVE_INTERFACE,
-                  Buf
-                  );
+  Status = gBS->InstallProtocolInterface (&Handle, Guid, EFI_NATIVE_INTERFACE, Buf);
   if (!EFI_ERROR (Status)) {
     mStubProtocol = Buf;
-    Say ("STUB installed", "", Status, (UINT64)(UINTN)Handle);
+    Say (Name, Status, (UINT64)(UINTN)Handle);
   } else {
-    Say ("STUB install FAILED", "", Status, 0);
+    Say (Name, Status, 0);
     FreePool (Buf);
   }
   return Status;
@@ -149,35 +160,25 @@ UsbProbeEntry (
   EFI_STATUS  Status;
   VOID        *Ifc = NULL;
 
-  Say ("=== UsbProbeDxe entry ===", "", EFI_SUCCESS, 0);
+  Say ("=== UsbProbeDxe entry ===", EFI_SUCCESS, 0);
 
-  Status = gBS->LocateProtocol (&mPmicUsbGuid, NULL, &Ifc);
+  Status = gBS->LocateProtocol (&mTypeCGuid, NULL, &Ifc);
   if (EFI_ERROR (Status)) {
-    Say ("PMIC USB NOT found -> install stub", "", Status, 0);
-    InstallStubPmicUsb ();
-    /* 再验证一次桩是否装成功 */
+    Say ("TypeC NOT found -> install stub", Status, 0);
+    InstallStub (&mTypeCGuid, "STUB installed");
     Ifc = NULL;
-    Status = gBS->LocateProtocol (&mPmicUsbGuid, NULL, &Ifc);
-    Say ("after stub: PMIC USB", "", Status, (UINT64)(UINTN)Ifc);
+    Status = gBS->LocateProtocol (&mTypeCGuid, NULL, &Ifc);
+    Say ("after stub: TypeC", Status, (UINT64)(UINTN)Ifc);
   } else {
-    Say ("PMIC USB found", "", Status, (UINT64)(UINTN)Ifc);
+    Say ("TypeC found", Status, (UINT64)(UINTN)Ifc);
   }
 
   PrintAll ("early");
 
-  Status = gBS->CreateEvent (
-                  EVT_TIMER,
-                  TPL_APPLICATION,
-                  ProbeTimerCallback,
-                  NULL,
-                  &mTimerEvent
-                  );
-  if (!EFI_ERROR (Status)) {
-    gBS->SetTimer (mTimerEvent, TimerRelative, 30000000ULL); /* 3s */
+  /* 周期心跳: 用来判断 DXE 调度是否卡死 */
+  if (!EFI_ERROR (gBS->CreateEvent (EVT_TIMER, TPL_CALLBACK, HeartbeatCallback, NULL, &mHeartbeatEvent))) {
+    gBS->SetTimer (mHeartbeatEvent, TimerPeriodic, 10000000ULL); /* 1s */
   }
-
-  /* 停 1 秒让屏幕上的输出可见 (崩溃发生在更晚的 AcpiTableDxe 之后) */
-  gBS->Stall (1000000);
 
   return EFI_SUCCESS;
 }

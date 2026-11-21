@@ -29,3 +29,5 @@
 
 [Components.common]
   Platform/Bbkedu/sdm660/UsbProbeDxe/UsbProbeDxe.inf
+  Platform/Bbkedu/sdm660/Stage2Dxe/Stage2Dxe.inf
+  Platform/Bbkedu/sdm660/Stage3Dxe/Stage3Dxe.inf
