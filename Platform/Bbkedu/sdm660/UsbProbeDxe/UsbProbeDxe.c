@@ -1,9 +1,10 @@
 /** @file
-  诊断/修复驱动 (v4):
+  诊断/修复驱动 (v5):
   1. 打印关键 protocol 状态 (ConOut + DebugLib 双通道);
   2. 若 USB Type-C protocol 缺失, 装 stub;
-  3. 周期心跳 (1s): 打印计数 + USB_CONFIG / USBFN_IO 是否存在.
-     若心跳不再打印 => 系统卡死在 DXE 调度阶段(不在 BDS 空闲).
+  3. 周期心跳 (1s): 计数 + USB_CONFIG / USBFN_IO + 卷(SimpleFileSystem)数量.
+     - 心跳持续 => 系统活着(不是 DXE 调度卡死);
+     - 卷数量 => 不用键盘也能确认 Shell 能看到哪些 FS 卷.
 **/
 #include <Uefi.h>
 #include <Library/UefiBootServicesTableLib.h>
@@ -13,12 +14,11 @@
 #include <Library/MemoryAllocationLib.h>
 #include <Library/DebugLib.h>
 
-#define HEARTBEAT_MAX 40
+#define HEARTBEAT_MAX 60
 
 STATIC EFI_EVENT mHeartbeatEvent;
 STATIC UINTN     mBeatCount;
 
-/* USB Type-C protocol: 6adb9972-083d-4be4-bb74-c725a7306156 */
 STATIC EFI_GUID mTypeCGuid = { 0x6adb9972, 0x083d, 0x4be4,
                                { 0xbb, 0x74, 0xc7, 0x25, 0xa7, 0x30, 0x61, 0x56 } };
 STATIC EFI_GUID mChipInfoGuid = { 0xb0760469, 0x970c, 0x487a,
@@ -37,6 +37,8 @@ STATIC EFI_GUID mUsbConfigGuid = { 0xe722b03f, 0xb250, 0x42ce,
                                    { 0x8e, 0xbd, 0x5b, 0xd5, 0x18, 0x12, 0xd0, 0x37 } };
 STATIC EFI_GUID mUsbfnIoGuid = { 0x32d2963a, 0xfe5d, 0x4f30,
                                  { 0xb6, 0x33, 0x6e, 0x5d, 0xc5, 0x58, 0x03, 0xcc } };
+STATIC EFI_GUID mSfsGuid = { 0x964e5b22, 0x6459, 0x11d2,
+                             { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } };
 
 STATIC VOID *mStubProtocol = NULL;
 
@@ -78,6 +80,29 @@ PrintOne (
 
 STATIC
 VOID
+PrintVolumes (
+  VOID
+  )
+{
+  EFI_STATUS  Status;
+  EFI_HANDLE  *Handles = NULL;
+  UINTN       Count = 0;
+  UINTN       i;
+
+  Status = gBS->LocateHandleBuffer (ByProtocol, &mSfsGuid, NULL, &Count, &Handles);
+  if (EFI_ERROR (Status)) {
+    Say ("volumes(fs)", Status, 0);
+    return;
+  }
+  Say ("volumes(fs)", EFI_SUCCESS, Count);
+  for (i = 0; i < Count && i < 8; i++) {
+    AsciiPrint ("UsbProbe:   fs handle[%u]=0x%lx\n", i, (UINT64)(UINTN)Handles[i]);
+  }
+  FreePool (Handles);
+}
+
+STATIC
+VOID
 PrintAll (
   IN CONST CHAR8 *Tag
   )
@@ -92,6 +117,7 @@ PrintAll (
   PrintOne ("AcpiSdt", &mAcpiSdtGuid);
   PrintOne ("USB_CONFIG", &mUsbConfigGuid);
   PrintOne ("USBFN_IO", &mUsbfnIoGuid);
+  PrintVolumes ();
   Say ("---- end ----", EFI_SUCCESS, 0);
 }
 
@@ -103,14 +129,14 @@ HeartbeatCallback (
   IN VOID      *Context
   )
 {
-  VOID  *Ifc;
-
   mBeatCount++;
-  Ifc = NULL;
-  Say ("HB", EFI_SUCCESS, mBeatCount);
-  PrintOne ("  USB_CONFIG", &mUsbConfigGuid);
-  PrintOne ("  USBFN_IO", &mUsbfnIoGuid);
-  PrintOne ("  AcpiSdt", &mAcpiSdtGuid);
+  AsciiPrint ("UsbProbe: HB %u\n", mBeatCount);
+  DEBUG ((DEBUG_ERROR, "UsbProbe: HB %u\n", mBeatCount));
+  if ((mBeatCount % 3) == 0) {
+    PrintOne ("  USB_CONFIG", &mUsbConfigGuid);
+    PrintOne ("  USBFN_IO", &mUsbfnIoGuid);
+    PrintVolumes ();
+  }
   if (mBeatCount >= HEARTBEAT_MAX) {
     gBS->CloseEvent (Event);
   }
@@ -161,6 +187,7 @@ UsbProbeEntry (
   VOID        *Ifc = NULL;
 
   Say ("=== UsbProbeDxe entry ===", EFI_SUCCESS, 0);
+  AsciiPrint ("UsbProbe: build v5 (heartbeat + fs volume list)\n");
 
   Status = gBS->LocateProtocol (&mTypeCGuid, NULL, &Ifc);
   if (EFI_ERROR (Status)) {
@@ -175,7 +202,6 @@ UsbProbeEntry (
 
   PrintAll ("early");
 
-  /* 周期心跳: 用来判断 DXE 调度是否卡死 */
   if (!EFI_ERROR (gBS->CreateEvent (EVT_TIMER, TPL_CALLBACK, HeartbeatCallback, NULL, &mHeartbeatEvent))) {
     gBS->SetTimer (mHeartbeatEvent, TimerPeriodic, 10000000ULL); /* 1s */
   }
