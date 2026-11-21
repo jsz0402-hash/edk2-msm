@@ -26,3 +26,6 @@
   gRenegadePkgTokenSpaceGuid.PcdDeviceVendor|"Bbkedu"
   gRenegadePkgTokenSpaceGuid.PcdDeviceProduct|"S5"
   gRenegadePkgTokenSpaceGuid.PcdDeviceCodeName|"h7000"
+
+[Components.common]
+  Platform/Bbkedu/sdm660/UsbProbeDxe/UsbProbeDxe.inf
